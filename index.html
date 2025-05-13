@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Video Half-Sphere Projector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+    }
+    
+    #start-button {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      padding: 10px 20px;
+      font-size: 16px;
+      background: rgba(0, 123, 255, 0.8);
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      z-index: 100;
+    }
+    
+    #status {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.6);
+      color: white;
+      padding: 10px;
+      border-radius: 5px;
+      text-align: center;
+      max-width: 80%;
+      z-index: 100;
+    }
+    
+    #debug {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: rgba(0, 0, 0, 0.7);
+      color: lime;
+      font-family: monospace;
+      padding: 5px;
+      font-size: 12px;
+      z-index: 100;
+      pointer-events: none;
+      max-width: 300px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    
+    .hidden {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <button id="start-button">Enter AR</button>
+  <div id="status" class="hidden"></div>
+  <div id="debug" class="hidden"></div>
+  
+  <!-- Hidden video element for preloading -->
+  <video id="video-source" style="display:none;" muted playsinline loop crossorigin="anonymous">
+    <source src="smartbackground.mp4" type="video/mp4">
+  </video>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+    
+    // ===========================================
+    // Constants and configuration
+    // ===========================================
+    const DEBUG = true;
+    const SPHERE_RADIUS = 0.5;
+    const SPHERE_SEGMENTS = 32;
+    const SPHERE_RINGS = 32;
+    
+    // ===========================================
+    // Global variables
+    // ===========================================
+    let camera, scene, renderer;
+    let xrSession = null;
+    let xrReferenceSpace = null;
+    let halfSphere;
+    let videoElement;
+    let videoTexture;
+    let videoState = 'unloaded'; // unloaded, loading, loaded, playing, error
+    
+    // ===========================================
+    // Debug logging
+    // ===========================================
+    const debugElement = document.getElementById('debug');
+    if (DEBUG) debugElement.classList.remove('hidden');
+    
+    function log(message) {
+      console.log(message);
+      if (DEBUG) {
+        debugElement.innerHTML += `${message}<br>`;
+        // Keep only the last 10 messages
+        const lines = debugElement.innerHTML.split('<br>');
+        if (lines.length > 10) {
+          debugElement.innerHTML = lines.slice(-10).join('<br>');
+        }
+        // Scroll to bottom
+        debugElement.scrollTop = debugElement.scrollHeight;
+      }
+    }
+    
+    // ===========================================
+    // Show status message
+    // ===========================================
+    function showStatus(message, autoHide = true) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.classList.remove('hidden');
+      
+      log(message);
+      
+      if (autoHide) {
+        setTimeout(() => {
+          statusElement.classList.add('hidden');
+        }, 3000);
+      }
+    }
+    
+    // ===========================================
+    // Initialize Three.js scene
+    // ===========================================
+    function initScene() {
+      // Create scene
+      scene = new THREE.Scene();
+      
+      // Create camera
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+      
+      // Create renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+      
+      // Add lights
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+      scene.add(ambientLight);
+      
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      directionalLight.position.set(0, 1, 2);
+      scene.add(directionalLight);
+      
+      // Handle window resize
+      window.addEventListener('resize', onWindowResize);
+      
+      log('Scene initialized');
+    }
+    
+    // ===========================================
+    // Initialize video element and texture
+    // ===========================================
+    function initVideo() {
+      log('Initializing video');
+      videoState = 'loading';
+      
+      // Get existing video element
+      videoElement = document.getElementById('video-source');
+      
+      // Add event listeners to track video state
+      videoElement.addEventListener('loadedmetadata', () => {
+        log('Video metadata loaded');
+      });
+      
+      videoElement.addEventListener('canplay', () => {
+        log('Video can play');
+        videoState = 'loaded';
+        createVideoTexture();
+      });
+      
+      videoElement.addEventListener('playing', () => {
+        log('Video playing');
+        videoState = 'playing';
+      });
+      
+      videoElement.addEventListener('error', (e) => {
+        const error = e.target.error;
+        log(`Video error: ${error ? error.message : 'unknown error'}`);
+        videoState = 'error';
+        showStatus('Error loading video', false);
+      });
+      
+      // Load the video
+      videoElement.load();
+      
+      // Fallback in case video loading takes too long
+      setTimeout(() => {
+        if (videoState === 'loading') {
+          log('Video load timeout - continuing anyway');
+          videoState = 'loaded';
+          createVideoTexture();
+        }
+      }, 5000);
+    }
+    
+    // ===========================================
+    // Create video texture
+    // ===========================================
+    function createVideoTexture() {
+      try {
+        log('Creating video texture');
+        
+        // Create texture from video
+        videoTexture = new THREE.VideoTexture(videoElement);
+        videoTexture.minFilter = THREE.LinearFilter;
+        videoTexture.magFilter = THREE.LinearFilter;
+        videoTexture.format = THREE.RGBAFormat;
+        videoTexture.generateMipmaps = false;
+        
+        log('Video texture created');
+      } catch (error) {
+        log(`Error creating video texture: ${error}`);
+      }
+    }
+    
+    // ===========================================
+    // Start video playback with retry mechanism
+    // ===========================================
+    function startVideoPlayback() {
+      if (!videoElement || videoState === 'playing') return;
+      
+      log('Starting video playback');
+      
+      // Try to play video
+      videoElement.play().then(() => {
+        log('Video playback started successfully');
+        videoState = 'playing';
+      }).catch(error => {
+        log(`Failed to autoplay video: ${error}`);
+        showStatus('Tap screen to start video');
+        
+        // Add global click handler to start video (for iOS)
+        const startVideo = function() {
+          videoElement.play().then(() => {
+            log('Video started after user interaction');
+            videoState = 'playing';
+            document.removeEventListener('click', startVideo);
+          }).catch(err => {
+            log(`Video play failed after user interaction: ${err}`);
+          });
+        };
+        
+        document.addEventListener('click', startVideo);
+      });
+    }
+    
+    // ===========================================
+    // Create half-sphere with video projection
+    // ===========================================
+    function createHalfSphere() {
+      log('Creating half-sphere');
+      
+      // Create half-sphere geometry
+      const geometry = new THREE.SphereGeometry(
+        SPHERE_RADIUS,
+        SPHERE_SEGMENTS,
+        SPHERE_RINGS,
+        0,        // phiStart - start angle
+        Math.PI * 2, // phiLength - horizontal sweep
+        0,        // thetaStart - vertical start angle
+        Math.PI / 2  // thetaLength - vertical sweep (half of PI for half-sphere)
+      );
+      
+      // Important: Invert the geometry so that the texture is on the inside
+      geometry.scale(-1, 1, 1);
+      
+      // Create material with video texture
+      const material = new THREE.MeshBasicMaterial({
+        map: videoTexture,
+        side: THREE.FrontSide // Use FrontSide because we inverted the geometry
+      });
+      
+      // Create mesh
+      halfSphere = new THREE.Mesh(geometry, material);
+      
+      // Position and rotate half-sphere
+      halfSphere.position.set(0, 0, -0.7);
+      halfSphere.rotation.x = Math.PI; // Flip to make the flat side face down
+      
+      // Add to scene
+      scene.add(halfSphere);
+      
+      log('Half-sphere created');
+    }
+    
+    // ===========================================
+    // Start AR session
+    // ===========================================
+    function startAR() {
+      if (!navigator.xr) {
+        showStatus('WebXR not supported in this browser', false);
+        return;
+      }
+      
+      log('Starting AR session');
+      
+      navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+        if (!supported) {
+          showStatus('AR not supported on this device', false);
+          return;
+        }
+        
+        // Request AR session
+        navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: document.body }
+        }).then(onSessionStarted);
+      });
+    }
+    
+    // ===========================================
+    // Handle AR session start
+    // ===========================================
+    function onSessionStarted(session) {
+      log('AR session started');
+      xrSession = session;
+      
+      // Set up session
+      session.addEventListener('end', onSessionEnded);
+      
+      // Initialize XR renderer
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      // Get reference space
+      session.requestReferenceSpace('local').then((referenceSpace) => {
+        xrReferenceSpace = referenceSpace;
+        
+        // Create half-sphere
+        createHalfSphere();
+        
+        // Start video playback
+        startVideoPlayback();
+        
+        // Hide UI
+        document.getElementById('start-button').classList.add('hidden');
+        
+        // Start render loop
+        renderer.setAnimationLoop(render);
+        
+        showStatus('AR session active. Video projected inside half-sphere.');
+      });
+    }
+    
+    // ===========================================
+    // Handle AR session end
+    // ===========================================
+    function onSessionEnded() {
+      log('AR session ended');
+      
+      // Clean up
+      if (videoElement) {
+        videoElement.pause();
+        videoState = 'loaded';
+      }
+      
+      // Reset XR state
+      xrSession = null;
+      xrReferenceSpace = null;
+      
+      // Clear scene
+      if (halfSphere) {
+        scene.remove(halfSphere);
+        halfSphere.geometry.dispose();
+        halfSphere.material.dispose();
+        halfSphere = null;
+      }
+      
+      // Stop render loop
+      renderer.setAnimationLoop(null);
+      
+      // Show UI
+      document.getElementById('start-button').classList.remove('hidden');
+      
+      showStatus('AR session ended');
+    }
+    
+    // ===========================================
+    // Render function
+    // ===========================================
+    function render(time, frame) {
+      // Verify video is still playing
+      if (videoElement && videoState === 'playing' && videoElement.paused) {
+        videoElement.play().catch(err => {
+          log(`Video restart failed: ${err}`);
+        });
+      }
+      
+      // Slowly rotate the half-sphere for a dynamic effect
+      if (halfSphere) {
+        halfSphere.rotation.y += 0.001;
+      }
+      
+      // Render scene
+      renderer.render(scene, camera);
+    }
+    
+    // ===========================================
+    // Handle window resize
+    // ===========================================
+    function onWindowResize() {
+      if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      if (renderer) {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+    }
+    
+    // ===========================================
+    // Initialize everything
+    // ===========================================
+    function init() {
+      log('Initializing application');
+      
+      // Initialize scene
+      initScene();
+      
+      // Initialize video
+      initVideo();
+      
+      // Add event listener for start button
+      document.getElementById('start-button').addEventListener('click', startAR);
+      
+      log('Initialization complete');
+    }
+    
+    // Start the application
+    window.addEventListener('load', init);
+  </script>
+</body>
+</html>
